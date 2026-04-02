@@ -234,9 +234,12 @@ func (iss *RateLimitIssuer) SetConfig(cfg *certmagic.Config) {
 // PreCheck implements certmagic.PreChecker. It performs fast in-memory limit
 // checks to reject requests early — before the inner issuer sets up challenge
 // infrastructure — then delegates to the inner issuer's PreCheck if present.
+//
+// Rate limit errors are wrapped in certmagic.ErrNoRetry so that the TLS
+// handshake fails immediately rather than blocking in certmagic's obtain loop.
 func (iss *RateLimitIssuer) PreCheck(ctx context.Context, names []string, interactive bool) error {
 	if err := iss.checkInMemoryLimits(names); err != nil {
-		return err
+		return certmagic.ErrNoRetry{Err: err}
 	}
 	if pc, ok := iss.issuer.(certmagic.PreChecker); ok {
 		return pc.PreCheck(ctx, names, interactive)
@@ -248,9 +251,12 @@ func (iss *RateLimitIssuer) PreCheck(ctx context.Context, names []string, intera
 // backed limit checks run before the inner issuer is called so that a
 // rejected request never triggers certificate issuance. Counters are recorded
 // only on successful issuance; a failed issuance does not consume a slot.
+//
+// Rate limit errors are wrapped in certmagic.ErrNoRetry so that the TLS
+// handshake fails immediately rather than blocking in certmagic's obtain loop.
 func (iss *RateLimitIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest) (*certmagic.IssuedCertificate, error) {
 	if err := iss.checkStorageLimits(ctx, csr.DNSNames); err != nil {
-		return nil, err
+		return nil, certmagic.ErrNoRetry{Err: err}
 	}
 	cert, err := iss.issuer.Issue(ctx, csr)
 	if err != nil {
