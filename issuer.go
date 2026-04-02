@@ -340,7 +340,7 @@ func (iss *RateLimitIssuer) checkCertCount(ctx context.Context, storageKey, doma
 	if err != nil {
 		return err
 	}
-	if _, ok := counts[subject]; ok {
+	if _, ok := counts[subjectKey(subject, domain)]; ok {
 		// Subject already counted — this issuance will be a no-op or renewal.
 		return nil
 	}
@@ -426,10 +426,11 @@ func (iss *RateLimitIssuer) recordCertCount(ctx context.Context, storageKey, dom
 	if err != nil {
 		return err
 	}
-	if _, ok := counts[subject]; ok {
+	key := subjectKey(subject, domain)
+	if _, ok := counts[key]; ok {
 		return nil // already recorded
 	}
-	counts[subject] = struct{}{}
+	counts[key] = struct{}{}
 	if err := iss.storeCertCount(ctx, storageKey, counts); err != nil {
 		return err
 	}
@@ -500,12 +501,8 @@ func (a *approvalState) cache(domain string, m map[string]time.Time) {
 	m[domain] = a.now().Add(atCapacityCacheTTL)
 }
 
-// certSubject extracts the registrable domain (eTLD+1) and the subject key
-// used for cert counting from a certificate name.
-//
-// The subject key is the name itself, which correctly deduplicates certificates:
-// all requests for *.example.com share the subject "*.example.com", while
-// www.example.com and api.example.com each have their own subject key.
+// certSubject extracts the registrable domain (eTLD+1) and the full certificate
+// subject name from a certificate name.
 func certSubject(name string) (domain, subject string, err error) {
 	lookup := strings.TrimPrefix(name, "*.")
 	domain, err = publicsuffix.EffectiveTLDPlusOne(lookup)
@@ -513,6 +510,21 @@ func certSubject(name string) (domain, subject string, err error) {
 		return "", "", fmt.Errorf("determining registrable domain for %q: %w", name, err)
 	}
 	return domain, name, nil
+}
+
+// subjectKey returns the storage key for a certificate subject relative to its
+// registrable domain. The domain is already encoded in the storage path, so
+// storing only the subdomain portion avoids redundancy.
+//
+//   - "*.example.com"      / "example.com" → "*"
+//   - "www.example.com"    / "example.com" → "www"
+//   - "api.v2.example.com" / "example.com" → "api.v2"
+//   - "example.com"        / "example.com" → ""
+func subjectKey(subject, domain string) string {
+	if subject == domain {
+		return ""
+	}
+	return strings.TrimSuffix(subject, "."+domain)
 }
 
 // certCountKey returns the per-instance storage key for the cert count of a

@@ -340,7 +340,7 @@ func TestRecordCertCount_AddsSubject(t *testing.T) {
 		t.Fatalf("recordCertCount: %v", err)
 	}
 	counts, _ := iss.loadCertCount(ctx, key)
-	if _, ok := counts["www.example.com"]; !ok {
+	if _, ok := counts["www"]; !ok {
 		t.Error("subject not found after recordCertCount")
 	}
 }
@@ -398,7 +398,7 @@ func TestRecordCertCount_GlobalKey_IndependentFromInstanceKey(t *testing.T) {
 
 	// Global key should have the subject.
 	counts, _ = iss.loadCertCount(ctx, globalKey)
-	if _, ok := counts["www.example.com"]; !ok {
+	if _, ok := counts["www"]; !ok {
 		t.Error("subject not found in global storage")
 	}
 }
@@ -711,7 +711,7 @@ func TestIssue_RecordsCountersOnSuccess(t *testing.T) {
 
 	// Per-issuer storage count incremented.
 	counts, _ := iss.loadCertCount(ctx, iss.certCountKey("example.com"))
-	if _, ok := counts["www.example.com"]; !ok {
+	if _, ok := counts["www"]; !ok {
 		t.Error("subject not recorded in per-issuer storage after issuance")
 	}
 
@@ -744,7 +744,7 @@ func TestIssue_RecordsGlobalCount(t *testing.T) {
 	}
 
 	counts, _ := iss.loadCertCount(ctx, iss.globalCertCountKey("example.com"))
-	if _, ok := counts["www.example.com"]; !ok {
+	if _, ok := counts["www"]; !ok {
 		t.Error("subject not recorded in global storage after issuance")
 	}
 }
