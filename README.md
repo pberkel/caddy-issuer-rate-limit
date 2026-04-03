@@ -28,15 +28,6 @@ xcaddy build \
   --with github.com/pberkel/caddy-issuer-rate-limit
 ```
 
-To use with the opportunistic issuer:
-
-```sh
-xcaddy build \
-  --with github.com/pberkel/caddy-issuer-rate-limit \
-  --with github.com/pberkel/caddy-issuer-opportunistic \
-  --with github.com/caddy-dns/<your-dns-provider>
-```
-
 ## Configuration
 
 ### Caddyfile
@@ -54,17 +45,8 @@ xcaddy build \
     tls {
         on_demand
         issuer rate_limit primary {
-            issuer opportunistic {
-                primary acme {
-                    dir https://acme-v02.api.letsencrypt.org/directory
-                    dns <provider> {
-                        # provider-specific credentials
-                    }
-                    dns_challenge_override_domain acme.example.net
-                }
-                fallback acme {
-                    dir https://acme-v02.api.letsencrypt.org/directory
-                }
+            issuer acme {
+                dir https://acme-v02.api.letsencrypt.org/directory
             }
             global_max_certs_per_domain 50
             max_certs_per_domain        20
@@ -121,21 +103,8 @@ Both `max_certs_per_domain` and `global_max_certs_per_domain` may be configured 
                 "module": "rate_limit",
                 "name": "primary",
                 "issuer": {
-                  "module": "opportunistic",
-                  "primary": {
-                    "module": "acme",
-                    "ca": "https://acme-v02.api.letsencrypt.org/directory",
-                    "challenges": {
-                      "dns": {
-                        "provider": { "name": "<provider>" },
-                        "override_domain": "acme.example.net"
-                      }
-                    }
-                  },
-                  "fallback": {
-                    "module": "acme",
-                    "ca": "https://acme-v02.api.letsencrypt.org/directory"
-                  }
+                  "module": "acme",
+                  "ca": "https://acme-v02.api.letsencrypt.org/directory"
                 },
                 "max_certs_per_domain": 20,
                 "global_max_certs_per_domain": 50,
@@ -198,7 +167,9 @@ For on-demand TLS deployments, use [`caddy-tls-permission-policy`](https://githu
     tls {
         on_demand
         issuer rate_limit primary {
-            issuer opportunistic { ... }
+            issuer acme {
+                dir https://acme-v02.api.letsencrypt.org/directory
+            }
             max_certs_per_domain        20
             global_max_certs_per_domain 50
             global_rate_limit           100 1h
