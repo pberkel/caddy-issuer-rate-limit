@@ -1,6 +1,6 @@
 # caddy-issuer-rate-limit
 
-A [Caddy](https://caddyserver.com) TLS issuer module (`tls.issuance.rate_limit`) that wraps any inner issuer and enforces configurable certificate issuance rate limits and per-domain certificate caps.
+A [Caddy](https://caddyserver.com) TLS issuer module (`tls.issuance.rate_limit`) that wraps any inner issuer and enforces configurable certificate issuance rate limits.
 
 > **Experimental:** The configuration interface may change before a stable release.
 
@@ -14,10 +14,8 @@ This module enforces limits at issuance time — after `SubjectTransformer` has 
 
 The module wraps an inner issuer and intercepts the issuance lifecycle at two points:
 
-1. **`PreCheck`** — fast in-memory checks (rate limit windows, at-capacity domain cache) reject requests before the inner issuer sets up challenge infrastructure.
-2. **`Issue`** — authoritative storage-backed checks run before delegating to the inner issuer. Counters are recorded **only on successful issuance**; a failed issuance does not consume a slot.
-
-Certificate counts are persisted to Caddy's configured storage backend (the same storage used for certificate data), making limits consistent across restarts and, when a distributed storage backend is used, across multiple Caddy instances.
+1. **`PreCheck`** — fast in-memory checks (rate limit windows) reject requests before the inner issuer sets up challenge infrastructure.
+2. **`Issue`** — delegates to the inner issuer. Counters are recorded **only on successful issuance**; a failed issuance does not consume a slot.
 
 ## Installation
 
@@ -44,16 +42,14 @@ xcaddy build \
 :443 {
     tls {
         on_demand
-        issuer rate_limit primary {
+        issuer rate_limit {
             issuer acme {
                 dir https://acme-v02.api.letsencrypt.org/directory
             }
-            global_max_certs_per_domain 50
-            max_certs_per_domain        20
-            global_rate_limit           100 1h
-            global_rate_limit           500 24h
-            per_domain_rate_limit       5   6h
-            per_domain_rate_limit       20  24h
+            global_rate_limit     100 1h
+            global_rate_limit     500 24h
+            per_domain_rate_limit 5   6h
+            per_domain_rate_limit 20  24h
         }
     }
     reverse_proxy localhost:8080
@@ -63,24 +59,18 @@ xcaddy build \
 #### Syntax
 
 ```
-issuer rate_limit [<name>] {
+issuer rate_limit {
     ...
 }
 ```
-
-`<name>` is an optional instance identifier. It is required when `max_certs_per_domain` is set; omit it when only rate limits or `global_max_certs_per_domain` are configured.
 
 #### Subdirectives
 
 | Subdirective | Required | Description |
 |---|---|---|
 | `issuer <module> { ... }` | Yes | Inner issuer to delegate certificate issuance to. Any `tls.issuance` module is accepted. |
-| `max_certs_per_domain <n>` | No | Maximum unique certificates per registrable domain (eTLD+1), scoped to this `rate_limit` instance. Requires `<name>`. Counts are persisted across restarts. |
-| `global_max_certs_per_domain <n>` | No | Maximum unique certificates per registrable domain (eTLD+1), counted globally across all `rate_limit` instances. Counts are persisted across restarts. |
 | `global_rate_limit <limit> <duration>` | No | Maximum new certificates across all domains within a rolling time window (e.g. `100 1h`). May be specified multiple times for tiered limits; all windows must have capacity. |
 | `per_domain_rate_limit <limit> <duration>` | No | Maximum new certificates per registrable domain within a rolling time window (e.g. `5 6h`). May be specified multiple times for tiered limits; all windows must have capacity. |
-
-Both `max_certs_per_domain` and `global_max_certs_per_domain` may be configured simultaneously; an issuance must satisfy both caps to proceed.
 
 ### JSON
 
@@ -101,13 +91,10 @@ Both `max_certs_per_domain` and `global_max_certs_per_domain` may be configured 
             "issuers": [
               {
                 "module": "rate_limit",
-                "name": "primary",
                 "issuer": {
                   "module": "acme",
                   "ca": "https://acme-v02.api.letsencrypt.org/directory"
                 },
-                "max_certs_per_domain": 20,
-                "global_max_certs_per_domain": 50,
                 "global_rate_limit": [
                   { "limit": 100, "duration": 3600000000000 },
                   { "limit": 500, "duration": 86400000000000 }
@@ -126,28 +113,20 @@ Both `max_certs_per_domain` and `global_max_certs_per_domain` may be configured 
 }
 ```
 
-## Counting behaviour
+## Rate limit behaviour
 
-Certificate subjects are counted per registrable domain (eTLD+1). The subject key used for deduplication is the certificate name as presented to the issuer — after any subject transformation. This has two important consequences:
+Rate limits are enforced per registrable domain (eTLD+1). Because limits apply after `SubjectTransformer` has run, hostnames that map to the same wildcard certificate share a single slot:
 
-- **Wildcard certificates:** `www.example.com` and `api.example.com` both transform to `*.example.com` before reaching this module. Both consume the same `*.example.com` slot — one certificate, one count.
-- **Specific certificates:** `www.example.com` and `api.example.com` issued without transformation each consume their own slot under `example.com`.
+- `www.example.com` and `api.example.com` both transforming to `*.example.com` count as one issuance against the `example.com` per-domain limit.
+- `www.example.com` and `api.example.com` issued without transformation each count independently under `example.com`.
 
-| Certificate subject | Registrable domain | Slot key |
-|---|---|---|
-| `*.example.com` | `example.com` | `*.example.com` |
-| `www.example.com` | `example.com` | `www.example.com` |
-| `api.v2.example.com` | `example.com` | `api.v2.example.com` |
-| `*.example.co.uk` | `example.co.uk` | `*.example.co.uk` |
+### Tiered limits
 
-### Certificate count scopes
+Both `global_rate_limit` and `per_domain_rate_limit` may be specified multiple times. Each entry defines an independent sliding window — an issuance must fit within **all** configured windows to proceed. This enables tiered constraints such as "no more than 5 per domain per 6 hours, and no more than 20 per domain per day".
 
-`max_certs_per_domain` and `global_max_certs_per_domain` enforce the same per-domain cap but with different storage scopes:
+### Multiple instances
 
-| Subdirective | Storage key | Scope |
-|---|---|---|
-| `max_certs_per_domain` | `tls_issuer_rate_limit/<name>/counts/<domain>.json` | Per `rate_limit` instance, identified by `<name>`. Two instances with different names maintain independent counts; two instances with the same name share counts. |
-| `global_max_certs_per_domain` | `tls_issuer_rate_limit/counts/<domain>.json` | Shared across all `rate_limit` instances regardless of name. |
+When multiple `rate_limit` instances are loaded into the same Caddy server, each maintains independent in-memory windows. A certificate issuance recorded by one instance does not advance the sliding window of another.
 
 ## Recommended usage with caddy-tls-permission-policy
 
@@ -166,16 +145,14 @@ For on-demand TLS deployments, use [`caddy-tls-permission-policy`](https://githu
 :443 {
     tls {
         on_demand
-        issuer rate_limit primary {
+        issuer rate_limit {
             issuer acme {
                 dir https://acme-v02.api.letsencrypt.org/directory
             }
-            max_certs_per_domain        20
-            global_max_certs_per_domain 50
-            global_rate_limit           100 1h
-            global_rate_limit           500 24h
-            per_domain_rate_limit       5   6h
-            per_domain_rate_limit       20  24h
+            global_rate_limit     100 1h
+            global_rate_limit     500 24h
+            per_domain_rate_limit 5   6h
+            per_domain_rate_limit 20  24h
         }
     }
 }

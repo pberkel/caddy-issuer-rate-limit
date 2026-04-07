@@ -29,36 +29,31 @@ import (
 //
 // Syntax:
 //
-//	issuer rate_limit [<name>] {
-//	    issuer                       <module> { ... }
-//	    global_max_certs_per_domain  <n>
-//	    max_certs_per_domain         <n>
-//	    global_rate_limit            <limit> <duration>
-//	    per_domain_rate_limit        <limit> <duration>
+//	issuer rate_limit {
+//	    issuer              <module> { ... }
+//	    global_rate_limit   <limit> <duration>
+//	    per_domain_rate_limit <limit> <duration>
 //	}
 //
-// issuer is required. name is required when max_certs_per_domain is set.
-// All other subdirectives are optional.
+// issuer is required. global_rate_limit and per_domain_rate_limit may be
+// repeated for tiered limits; all windows must have capacity for issuance to
+// proceed.
 //
 // Example:
 //
-//	issuer rate_limit primary {
-//	    issuer opportunistic {
-//	        primary  acme { ... }
-//	        fallback acme { ... }
+//	issuer rate_limit {
+//	    issuer acme {
+//	        dir https://acme-v02.api.letsencrypt.org/directory
 //	    }
-//	    max_certs_per_domain        20
-//	    global_max_certs_per_domain 50
-//	    global_rate_limit           100 1h
-//	    per_domain_rate_limit       5   6h
+//	    global_rate_limit   100 1h
+//	    global_rate_limit   500 24h
+//	    per_domain_rate_limit 5  6h
+//	    per_domain_rate_limit 20 24h
 //	}
 func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume "rate_limit"
 	if d.NextArg() {
-		iss.Name = d.Val()
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+		return d.ArgErr()
 	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
@@ -72,22 +67,6 @@ func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			iss.IssuerRaw = raw
-
-		case "max_certs_per_domain":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			if err := setCaddyInt(d.Val(), &iss.MaxCertsPerDomain, &iss.MaxCertsPerDomainRaw); err != nil {
-				return d.Errf("invalid max_certs_per_domain value: %v", err)
-			}
-
-		case "global_max_certs_per_domain":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			if err := setCaddyInt(d.Val(), &iss.GlobalMaxCertsPerDomain, &iss.GlobalMaxCertsPerDomainRaw); err != nil {
-				return d.Errf("invalid global_max_certs_per_domain value: %v", err)
-			}
 
 		case "global_rate_limit":
 			args := d.RemainingArgs()
@@ -129,23 +108,6 @@ func unmarshalIssuer(d *caddyfile.Dispenser) ([]byte, error) {
 		return nil, d.Errf("module %s (%T) is not a certmagic.Issuer", modID, unm)
 	}
 	return caddyconfig.JSONModuleObject(issuer, "module", modName, nil), nil
-}
-
-// setCaddyInt sets intDst to the parsed integer when val is a plain number, or
-// rawDst to val when it contains a Caddy placeholder. This keeps the resolved
-// value visible in the running JSON config for literal values while preserving
-// placeholder expressions for deferred resolution during provisioning.
-func setCaddyInt(val string, intDst *int, rawDst *string) error {
-	if strings.Contains(val, "{") {
-		*rawDst = val
-		return nil
-	}
-	n, err := strconv.Atoi(val)
-	if err != nil {
-		return err
-	}
-	*intDst = n
-	return nil
 }
 
 // makeCaddyRateLimit constructs a RateLimit from Caddyfile token strings.
