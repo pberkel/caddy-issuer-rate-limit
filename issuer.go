@@ -168,6 +168,16 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("inner issuer is required")
 	}
 
+	poolNames := make([]string, 0, len(iss.SharedPools))
+	for _, sp := range iss.SharedPools {
+		poolNames = append(poolNames, sp.Name)
+	}
+	iss.logger.Info("rate_limit issuer ready",
+		zap.Int("rate_limits", len(iss.RateLimit)),
+		zap.Int("per_domain_rate_limits", len(iss.PerDomainRateLimit)),
+		zap.Strings("shared_pools", poolNames),
+	)
+
 	return nil
 }
 
