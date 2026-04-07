@@ -24,6 +24,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
+	"go.uber.org/zap"
 )
 
 // --- Helpers ----------------------------------------------------------------
@@ -65,20 +66,22 @@ func (p *preCheckerIssuer) PreCheck(_ context.Context, _ []string, _ bool) error
 func newTestIssuer(inner certmagic.Issuer) *RateLimitIssuer {
 	return &RateLimitIssuer{
 		issuer: inner,
+		logger: zap.NewNop(),
 		rateLimiter: &rateLimitState{
 			domains: make(map[string][]*slidingWindow),
 			now:     time.Now,
 		},
+		sharedLimiters: make(map[string]*registryEntry),
 	}
 }
 
-// newTestIssuerWithLimits returns a RateLimitIssuer with optional rate limits
-// configured.
+// newTestIssuerWithLimits returns a RateLimitIssuer with optional local rate
+// limits configured.
 func newTestIssuerWithLimits(inner certmagic.Issuer, globalRL, perDomainRL *RateLimit) *RateLimitIssuer {
 	iss := newTestIssuer(inner)
 	if globalRL != nil {
-		iss.GlobalRateLimit = []*RateLimit{globalRL}
-		iss.rateLimiter.globalLimits = iss.GlobalRateLimit
+		iss.RateLimit = []*RateLimit{globalRL}
+		iss.rateLimiter.globalLimits = iss.RateLimit
 		iss.rateLimiter.globals = []*slidingWindow{{}}
 	}
 	if perDomainRL != nil {
@@ -86,6 +89,16 @@ func newTestIssuerWithLimits(inner certmagic.Issuer, globalRL, perDomainRL *Rate
 		iss.rateLimiter.perDomainLimits = iss.PerDomainRateLimit
 	}
 	return iss
+}
+
+// addSharedPool registers a test-scoped shared pool on iss and returns the
+// registry entry. The pool is removed from the process registry on cleanup.
+func addSharedPool(t *testing.T, iss *RateLimitIssuer, sp *SharedPool) *registryEntry {
+	t.Helper()
+	t.Cleanup(func() { processRegistry.Delete(sp.Name) })
+	entry := getOrRegisterPool(sp, zap.NewNop())
+	iss.sharedLimiters[sp.Name] = entry
+	return entry
 }
 
 func makeRateLimit(limit int, d time.Duration) *RateLimit {
@@ -136,12 +149,12 @@ func TestCheckRateLimits_NoLimits(t *testing.T) {
 	}
 }
 
-func TestCheckRateLimits_GlobalRateLimitExceeded(t *testing.T) {
+func TestCheckRateLimits_LocalRateLimitExceeded(t *testing.T) {
 	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(1, time.Hour), nil)
 	iss.rateLimiter.recordGlobal()
 
 	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
-		t.Error("expected global rate limit error")
+		t.Error("expected local rate limit error")
 	}
 }
 
@@ -160,6 +173,47 @@ func TestCheckRateLimits_DeduplicatesDomains(t *testing.T) {
 
 	if err := iss.checkRateLimits([]string{"www.example.com", "api.example.com"}); err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckRateLimits_SharedPoolExceeded(t *testing.T) {
+	iss := newTestIssuer(&stubIssuer{})
+	sp := makeSharedPool(t.Name(), 1, time.Hour)
+	entry := addSharedPool(t, iss, sp)
+	entry.state.recordGlobal()
+
+	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
+		t.Error("expected shared pool rate limit error")
+	}
+}
+
+func TestCheckRateLimits_SharedPoolSharedAcrossInstances(t *testing.T) {
+	sp := makeSharedPool(t.Name(), 1, time.Hour)
+
+	iss1 := newTestIssuer(&stubIssuer{})
+	entry1 := addSharedPool(t, iss1, sp)
+
+	iss2 := newTestIssuer(&stubIssuer{})
+	iss2.sharedLimiters[sp.Name] = entry1 // share the same entry
+
+	// Record via iss1's shared pool.
+	iss1.recordLimiter(entry1.state, []string{"www.example.com"})
+
+	// iss2 should see the shared state as exceeded.
+	if err := iss2.checkRateLimits([]string{"www.example.com"}); err == nil {
+		t.Error("expected iss2 to see rate limit recorded by iss1")
+	}
+}
+
+func TestCheckRateLimits_LocalAndSharedCheckedIndependently(t *testing.T) {
+	// Local is fine, shared is exceeded — overall should fail.
+	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(10, time.Hour), nil)
+	sp := makeSharedPool(t.Name(), 1, time.Hour)
+	entry := addSharedPool(t, iss, sp)
+	entry.state.recordGlobal()
+
+	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
+		t.Error("expected error when shared pool is exceeded even though local has capacity")
 	}
 }
 
@@ -252,7 +306,7 @@ func TestIssue_InnerError_NoCountRecorded(t *testing.T) {
 	}
 }
 
-func TestIssue_RecordsCountersOnSuccess(t *testing.T) {
+func TestIssue_RecordsLocalCounters(t *testing.T) {
 	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(100, time.Hour), makeRateLimit(10, time.Hour))
 
 	if _, err := iss.Issue(context.Background(), &x509.CertificateRequest{DNSNames: []string{"www.example.com"}}); err != nil {
@@ -260,7 +314,7 @@ func TestIssue_RecordsCountersOnSuccess(t *testing.T) {
 	}
 
 	iss.rateLimiter.mu.Lock()
-	globalCount := iss.rateLimiter.globals[0].count(time.Now(), time.Duration(iss.GlobalRateLimit[0].Duration))
+	globalCount := iss.rateLimiter.globals[0].count(time.Now(), time.Duration(iss.RateLimit[0].Duration))
 	domainWindows, hasDomain := iss.rateLimiter.domains["example.com"]
 	var domainCount int
 	if hasDomain {
@@ -276,6 +330,106 @@ func TestIssue_RecordsCountersOnSuccess(t *testing.T) {
 	}
 }
 
+func TestIssue_RecordsSharedCounters(t *testing.T) {
+	iss := newTestIssuer(&stubIssuer{})
+	sp := makeSharedPool(t.Name(), 100, time.Hour)
+	entry := addSharedPool(t, iss, sp)
+
+	if _, err := iss.Issue(context.Background(), &x509.CertificateRequest{DNSNames: []string{"www.example.com"}}); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	entry.state.mu.Lock()
+	count := entry.state.globals[0].count(time.Now(), time.Hour)
+	entry.state.mu.Unlock()
+
+	if count != 1 {
+		t.Errorf("shared pool global counter = %d, want 1", count)
+	}
+}
+
+// --- Cleanup / SetConfig ----------------------------------------------------
+
+func TestCleanup_SavesPoolState(t *testing.T) {
+	iss := newTestIssuer(&stubIssuer{})
+	sp := makeSharedPool(t.Name(), 10, time.Hour)
+	entry := addSharedPool(t, iss, sp)
+	entry.state.recordGlobal()
+
+	st := newMemStorage()
+	iss.storage = st
+
+	if err := iss.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if !st.Exists(context.Background(), poolStorageKey(sp.Name)) {
+		t.Error("expected pool state to be saved to storage after Cleanup")
+	}
+}
+
+func TestCleanup_NoStorage_IsNoop(t *testing.T) {
+	iss := newTestIssuer(&stubIssuer{})
+	// No storage configured — should not panic.
+	if err := iss.Cleanup(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestSetConfig_LoadsPoolState(t *testing.T) {
+	sp := makeSharedPool(t.Name(), 10, time.Hour)
+	t.Cleanup(func() { processRegistry.Delete(sp.Name) })
+
+	// Pre-populate storage with a persisted timestamp.
+	st := newMemStorage()
+	now := time.Now()
+	entryA := newRegistryEntry(sp)
+	entryA.state.globals[0].add(now.Add(-20*time.Minute), time.Hour)
+	savePoolState(context.Background(), st, entryA, zap.NewNop())
+
+	// Create a fresh issuer and inject the pool (entry not yet loaded).
+	iss := newTestIssuer(&stubIssuer{})
+	entry := getOrRegisterPool(sp, zap.NewNop())
+	iss.sharedLimiters[sp.Name] = entry
+
+	cfg := &certmagic.Config{Storage: st}
+	iss.SetConfig(cfg)
+
+	entry.state.mu.Lock()
+	count := entry.state.globals[0].count(now, time.Hour)
+	entry.state.mu.Unlock()
+
+	if count != 1 {
+		t.Errorf("count after SetConfig load = %d, want 1", count)
+	}
+}
+
+func TestSetConfig_LoadsOnlyOnce(t *testing.T) {
+	sp := makeSharedPool(t.Name(), 10, time.Hour)
+	t.Cleanup(func() { processRegistry.Delete(sp.Name) })
+
+	st := newMemStorage()
+	now := time.Now()
+	entryA := newRegistryEntry(sp)
+	entryA.state.globals[0].add(now.Add(-20*time.Minute), time.Hour)
+	savePoolState(context.Background(), st, entryA, zap.NewNop())
+
+	iss := newTestIssuer(&stubIssuer{})
+	entry := getOrRegisterPool(sp, zap.NewNop())
+	iss.sharedLimiters[sp.Name] = entry
+
+	cfg := &certmagic.Config{Storage: st}
+	iss.SetConfig(cfg)
+	iss.SetConfig(cfg) // second call must not double-apply
+
+	entry.state.mu.Lock()
+	count := entry.state.globals[0].count(now, time.Hour)
+	entry.state.mu.Unlock()
+
+	if count != 1 {
+		t.Errorf("count after two SetConfig calls = %d, want 1 (should load only once)", count)
+	}
+}
+
 // --- IssuerKey --------------------------------------------------------------
 
 func TestIssuerKey(t *testing.T) {
@@ -285,7 +439,7 @@ func TestIssuerKey(t *testing.T) {
 	}
 }
 
-// --- SetConfig --------------------------------------------------------------
+// --- SetConfig propagation --------------------------------------------------
 
 type configSetterIssuer struct {
 	stubIssuer

@@ -54,13 +54,20 @@ func init() {
 // used with tls.issuance.opportunistic, where multiple hostnames may map to
 // the same wildcard certificate.
 //
-// # Multiple instances
+// # Local limits
 //
-// When multiple RateLimitIssuer instances are loaded into the same Caddy
-// server (e.g. across different automation policies), each instance maintains
-// independent in-memory rate limit windows. A certificate issuance recorded by
-// one instance does not advance the sliding window of another, so the effective
-// combined rate may be higher than the configured per-instance limit.
+// RateLimit and PerDomainRateLimit are local to this instance — each
+// RateLimitIssuer maintains independent in-memory windows.
+//
+// # Shared pools
+//
+// SharedPools allows multiple RateLimitIssuer instances within the same Caddy
+// process to share rate limit state. Instances referencing the same pool name
+// share in-memory sliding windows. Shared pool state is persisted to Caddy's
+// configured storage backend and restored on startup.
+//
+// Use the conventional pool name "global" to create a process-wide limit that
+// all rate_limit instances participate in.
 //
 // EXPERIMENTAL: Subject to change.
 type RateLimitIssuer struct {
@@ -68,20 +75,27 @@ type RateLimitIssuer struct {
 	// Any tls.issuance module is accepted. Required.
 	IssuerRaw json.RawMessage `json:"issuer,omitempty" caddy:"namespace=tls.issuance inline_key=module"`
 
-	// Global issuance rate limits across all domains. Each entry enforces an
-	// independent sliding window; all windows must have capacity for issuance
-	// to proceed. Multiple entries allow tiered limits (e.g. 100/hour and
-	// 500/day simultaneously).
-	GlobalRateLimit []*RateLimit `json:"global_rate_limit,omitempty"`
+	// Local issuance rate limits across all domains, scoped to this instance.
+	// Each entry enforces an independent sliding window; all windows must have
+	// capacity for issuance to proceed. Multiple entries allow tiered limits
+	// (e.g. 100/hour and 500/day simultaneously).
+	RateLimit []*RateLimit `json:"rate_limit,omitempty"`
 
-	// Per registrable domain issuance rate limits. Each entry enforces an
-	// independent sliding window per domain; all windows must have capacity.
-	// Multiple entries allow tiered limits (e.g. 5/6h and 20/day per domain).
+	// Local per registrable domain issuance rate limits, scoped to this
+	// instance. Each entry enforces an independent sliding window per domain;
+	// all windows must have capacity. Multiple entries allow tiered limits.
 	PerDomainRateLimit []*RateLimit `json:"per_domain_rate_limit,omitempty"`
 
-	issuer      certmagic.Issuer
-	logger      *zap.Logger
-	rateLimiter *rateLimitState
+	// Named shared pools whose rate limit state is shared across all
+	// RateLimitIssuer instances referencing the same pool name. State is
+	// persisted across restarts.
+	SharedPools []*SharedPool `json:"shared_pools,omitempty"`
+
+	issuer         certmagic.Issuer
+	logger         *zap.Logger
+	rateLimiter    *rateLimitState           // local limiter
+	sharedLimiters map[string]*registryEntry // keyed by pool name
+	storage        certmagic.Storage         // for shared pool persistence
 }
 
 // CaddyModule returns the Caddy module information.
@@ -98,11 +112,11 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 
 	repl := caddy.NewReplacer()
 
-	for _, rl := range iss.GlobalRateLimit {
-		if err := rl.resolve(repl, "global_rate_limit"); err != nil {
+	for _, rl := range iss.RateLimit {
+		if err := rl.resolve(repl, "rate_limit"); err != nil {
 			return err
 		}
-		if err := rl.validate("global_rate_limit"); err != nil {
+		if err := rl.validate("rate_limit"); err != nil {
 			return err
 		}
 	}
@@ -115,16 +129,32 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	globals := make([]*slidingWindow, len(iss.GlobalRateLimit))
+	globals := make([]*slidingWindow, len(iss.RateLimit))
 	for i := range globals {
 		globals[i] = &slidingWindow{}
 	}
 	iss.rateLimiter = &rateLimitState{
-		globalLimits:    iss.GlobalRateLimit,
+		globalLimits:    iss.RateLimit,
 		perDomainLimits: iss.PerDomainRateLimit,
 		globals:         globals,
 		domains:         make(map[string][]*slidingWindow),
 		now:             time.Now,
+	}
+
+	seen := make(map[string]struct{}, len(iss.SharedPools))
+	iss.sharedLimiters = make(map[string]*registryEntry, len(iss.SharedPools))
+	for _, sp := range iss.SharedPools {
+		if err := sp.resolve(repl); err != nil {
+			return err
+		}
+		if err := sp.validate(); err != nil {
+			return err
+		}
+		if _, dup := seen[sp.Name]; dup {
+			return fmt.Errorf("duplicate shared pool name %q", sp.Name)
+		}
+		seen[sp.Name] = struct{}{}
+		iss.sharedLimiters[sp.Name] = getOrRegisterPool(sp, iss.logger)
 	}
 
 	if iss.IssuerRaw != nil {
@@ -142,11 +172,38 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 }
 
 // SetConfig implements caddytls.ConfigSetter. It propagates the certmagic
-// config to the inner issuer.
+// config to the inner issuer and, on first call with a non-nil storage backend,
+// loads persisted state for any configured shared pools.
 func (iss *RateLimitIssuer) SetConfig(cfg *certmagic.Config) {
 	if cs, ok := iss.issuer.(caddytls.ConfigSetter); ok {
 		cs.SetConfig(cfg)
 	}
+	if cfg.Storage == nil || len(iss.sharedLimiters) == 0 {
+		return
+	}
+	iss.storage = cfg.Storage
+	ctx := context.Background()
+	for _, entry := range iss.sharedLimiters {
+		entry.mu.Lock()
+		if !entry.loaded {
+			loadAndApplyPoolState(ctx, cfg.Storage, entry, iss.logger)
+			entry.loaded = true
+		}
+		entry.mu.Unlock()
+	}
+}
+
+// Cleanup implements caddy.CleanerUpper. It persists shared pool state to
+// storage. Errors are logged but do not prevent cleanup.
+func (iss *RateLimitIssuer) Cleanup() error {
+	if iss.storage == nil || len(iss.sharedLimiters) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	for _, entry := range iss.sharedLimiters {
+		savePoolState(ctx, iss.storage, entry, iss.logger)
+	}
+	return nil
 }
 
 // PreCheck implements certmagic.PreChecker. It performs fast in-memory rate
@@ -202,16 +259,29 @@ func (iss *RateLimitIssuer) Revoke(ctx context.Context, cert certmagic.Certifica
 	return fmt.Errorf("inner issuer does not support revocation")
 }
 
-// checkRateLimits checks all in-memory rate limit windows.
+// checkRateLimits checks all rate limit windows — local and shared.
 func (iss *RateLimitIssuer) checkRateLimits(names []string) error {
-	if len(iss.GlobalRateLimit) > 0 {
-		if err := iss.rateLimiter.checkGlobal(); err != nil {
+	if err := iss.checkLimiter(iss.rateLimiter, names); err != nil {
+		return err
+	}
+	for _, entry := range iss.sharedLimiters {
+		if err := iss.checkLimiter(entry.state, names); err != nil {
 			return err
 		}
 	}
-	if len(iss.PerDomainRateLimit) > 0 {
+	return nil
+}
+
+// checkLimiter checks all windows in a single rateLimitState.
+func (iss *RateLimitIssuer) checkLimiter(s *rateLimitState, names []string) error {
+	if len(s.globalLimits) > 0 {
+		if err := s.checkGlobal(); err != nil {
+			return err
+		}
+	}
+	if len(s.perDomainLimits) > 0 {
 		for _, domain := range iss.uniqueDomains(names) {
-			if err := iss.rateLimiter.checkDomain(domain); err != nil {
+			if err := s.checkDomain(domain); err != nil {
 				return err
 			}
 		}
@@ -220,14 +290,22 @@ func (iss *RateLimitIssuer) checkRateLimits(names []string) error {
 }
 
 // recordIssuance records a successful certificate issuance in all rate limit
-// counters.
+// counters — local and shared.
 func (iss *RateLimitIssuer) recordIssuance(names []string) {
-	if len(iss.GlobalRateLimit) > 0 {
-		iss.rateLimiter.recordGlobal()
+	iss.recordLimiter(iss.rateLimiter, names)
+	for _, entry := range iss.sharedLimiters {
+		iss.recordLimiter(entry.state, names)
 	}
-	if len(iss.PerDomainRateLimit) > 0 {
+}
+
+// recordLimiter records an issuance in a single rateLimitState.
+func (iss *RateLimitIssuer) recordLimiter(s *rateLimitState, names []string) {
+	if len(s.globalLimits) > 0 {
+		s.recordGlobal()
+	}
+	if len(s.perDomainLimits) > 0 {
 		for _, domain := range iss.uniqueDomains(names) {
-			iss.rateLimiter.recordDomain(domain)
+			s.recordDomain(domain)
 		}
 	}
 }
@@ -268,6 +346,7 @@ func certDomain(name string) (string, error) {
 var (
 	_ caddy.Module                = (*RateLimitIssuer)(nil)
 	_ caddy.Provisioner           = (*RateLimitIssuer)(nil)
+	_ caddy.CleanerUpper          = (*RateLimitIssuer)(nil)
 	_ certmagic.Issuer            = (*RateLimitIssuer)(nil)
 	_ certmagic.PreChecker        = (*RateLimitIssuer)(nil)
 	_ certmagic.Revoker           = (*RateLimitIssuer)(nil)

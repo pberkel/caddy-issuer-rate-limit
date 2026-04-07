@@ -31,11 +31,11 @@ import (
 //
 //	issuer rate_limit {
 //	    issuer              <module> { ... }
-//	    global_rate_limit   <limit> <duration>
+//	    rate_limit   <limit> <duration>
 //	    per_domain_rate_limit <limit> <duration>
 //	}
 //
-// issuer is required. global_rate_limit and per_domain_rate_limit may be
+// issuer is required. rate_limit and per_domain_rate_limit may be
 // repeated for tiered limits; all windows must have capacity for issuance to
 // proceed.
 //
@@ -45,8 +45,8 @@ import (
 //	    issuer acme {
 //	        dir https://acme-v02.api.letsencrypt.org/directory
 //	    }
-//	    global_rate_limit   100 1h
-//	    global_rate_limit   500 24h
+//	    rate_limit   100 1h
+//	    rate_limit   500 24h
 //	    per_domain_rate_limit 5  6h
 //	    per_domain_rate_limit 20 24h
 //	}
@@ -68,12 +68,12 @@ func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			iss.IssuerRaw = raw
 
-		case "global_rate_limit":
+		case "rate_limit":
 			args := d.RemainingArgs()
 			if len(args) != 2 {
-				return d.Err("global_rate_limit requires exactly two arguments: <limit> <duration>")
+				return d.Err("rate_limit requires exactly two arguments: <limit> <duration>")
 			}
-			iss.GlobalRateLimit = append(iss.GlobalRateLimit, makeCaddyRateLimit(args[0], args[1]))
+			iss.RateLimit = append(iss.RateLimit, makeCaddyRateLimit(args[0], args[1]))
 
 		case "per_domain_rate_limit":
 			args := d.RemainingArgs()
@@ -81,6 +81,34 @@ func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("per_domain_rate_limit requires exactly two arguments: <limit> <duration>")
 			}
 			iss.PerDomainRateLimit = append(iss.PerDomainRateLimit, makeCaddyRateLimit(args[0], args[1]))
+
+		case "shared":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			sp := &SharedPool{Name: d.Val()}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				switch d.Val() {
+				case "rate_limit":
+					args := d.RemainingArgs()
+					if len(args) != 2 {
+						return d.Err("rate_limit requires exactly two arguments: <limit> <duration>")
+					}
+					sp.RateLimit = append(sp.RateLimit, makeCaddyRateLimit(args[0], args[1]))
+				case "per_domain_rate_limit":
+					args := d.RemainingArgs()
+					if len(args) != 2 {
+						return d.Err("per_domain_rate_limit requires exactly two arguments: <limit> <duration>")
+					}
+					sp.PerDomainRateLimit = append(sp.PerDomainRateLimit, makeCaddyRateLimit(args[0], args[1]))
+				default:
+					return d.Errf("unknown subdirective '%s'", d.Val())
+				}
+			}
+			iss.SharedPools = append(iss.SharedPools, sp)
 
 		default:
 			return d.Errf("unknown subdirective '%s'", d.Val())
