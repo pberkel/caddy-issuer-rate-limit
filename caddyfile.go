@@ -16,7 +16,6 @@ package ratelimitissuer
 
 import (
 	"strconv"
-	"strings"
 
 	"github.com/caddyserver/certmagic"
 
@@ -29,19 +28,20 @@ import (
 //
 // Syntax:
 //
-//	issuer rate_limit {
-//	    issuer              <module> { ... }
-//	    rate_limit   <limit> <duration>
+//	issuer rate_limit [<id>] {
+//	    issuer <module> { ... }
+//	    rate_limit <limit> <duration>
 //	    per_domain_rate_limit <limit> <duration>
 //	}
 //
-// issuer is required. rate_limit and per_domain_rate_limit may be
-// repeated for tiered limits; all windows must have capacity for issuance to
-// proceed.
+// id is an optional stable identifier for this instance used as the key in
+// the admin registry. If omitted, a UUID is generated at provision time.
+// issuer is required. rate_limit and per_domain_rate_limit may be repeated
+// for tiered limits; all windows must have capacity for issuance to proceed.
 //
 // Example:
 //
-//	issuer rate_limit {
+//	issuer rate_limit my-issuer {
 //	    issuer acme {
 //	        dir https://acme-v02.api.letsencrypt.org/directory
 //	    }
@@ -53,7 +53,10 @@ import (
 func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume "rate_limit"
 	if d.NextArg() {
-		return d.ArgErr()
+		iss.InstanceID = d.Val()
+		if d.NextArg() {
+			return d.ArgErr()
+		}
 	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
@@ -73,14 +76,22 @@ func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if len(args) != 2 {
 				return d.Err("rate_limit requires exactly two arguments: <limit> <duration>")
 			}
-			iss.RateLimit = append(iss.RateLimit, makeCaddyRateLimit(args[0], args[1]))
+			rl, err := makeCaddyRateLimit(d, args[0], args[1])
+			if err != nil {
+				return err
+			}
+			iss.RateLimit = append(iss.RateLimit, rl)
 
 		case "per_domain_rate_limit":
 			args := d.RemainingArgs()
 			if len(args) != 2 {
 				return d.Err("per_domain_rate_limit requires exactly two arguments: <limit> <duration>")
 			}
-			iss.PerDomainRateLimit = append(iss.PerDomainRateLimit, makeCaddyRateLimit(args[0], args[1]))
+			rl, err := makeCaddyRateLimit(d, args[0], args[1])
+			if err != nil {
+				return err
+			}
+			iss.PerDomainRateLimit = append(iss.PerDomainRateLimit, rl)
 
 		case "shared":
 			if !d.NextArg() {
@@ -97,13 +108,21 @@ func (iss *RateLimitIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if len(args) != 2 {
 						return d.Err("rate_limit requires exactly two arguments: <limit> <duration>")
 					}
-					sp.RateLimit = append(sp.RateLimit, makeCaddyRateLimit(args[0], args[1]))
+					rl, err := makeCaddyRateLimit(d, args[0], args[1])
+					if err != nil {
+						return err
+					}
+					sp.RateLimit = append(sp.RateLimit, rl)
 				case "per_domain_rate_limit":
 					args := d.RemainingArgs()
 					if len(args) != 2 {
 						return d.Err("per_domain_rate_limit requires exactly two arguments: <limit> <duration>")
 					}
-					sp.PerDomainRateLimit = append(sp.PerDomainRateLimit, makeCaddyRateLimit(args[0], args[1]))
+					rl, err := makeCaddyRateLimit(d, args[0], args[1])
+					if err != nil {
+						return err
+					}
+					sp.PerDomainRateLimit = append(sp.PerDomainRateLimit, rl)
 				default:
 					return d.Errf("unknown subdirective '%s'", d.Val())
 				}
@@ -138,26 +157,18 @@ func unmarshalIssuer(d *caddyfile.Dispenser) ([]byte, error) {
 	return caddyconfig.JSONModuleObject(issuer, "module", modName, nil), nil
 }
 
-// makeCaddyRateLimit constructs a RateLimit from Caddyfile token strings.
-// Plain integers and durations are parsed immediately; placeholder expressions
-// are stored in the Raw fields for deferred resolution during provisioning.
-func makeCaddyRateLimit(limitVal, durationVal string) *RateLimit {
-	rl := &RateLimit{}
-	if strings.Contains(limitVal, "{") {
-		rl.LimitRaw = limitVal
-	} else if n, err := strconv.Atoi(limitVal); err == nil {
-		rl.Limit = n
-	} else {
-		rl.LimitRaw = limitVal // will fail at provision time with a clear error
+// makeCaddyRateLimit constructs a RateLimit from Caddyfile token strings,
+// parsing the limit and duration immediately.
+func makeCaddyRateLimit(d *caddyfile.Dispenser, limitVal, durationVal string) (*RateLimit, error) {
+	n, err := strconv.Atoi(limitVal)
+	if err != nil {
+		return nil, d.Errf("invalid limit %q: expected a positive integer", limitVal)
 	}
-	if strings.Contains(durationVal, "{") {
-		rl.DurationRaw = durationVal
-	} else if d, err := caddy.ParseDuration(durationVal); err == nil {
-		rl.Duration = caddy.Duration(d)
-	} else {
-		rl.DurationRaw = durationVal // will fail at provision time with a clear error
+	dur, err := caddy.ParseDuration(durationVal)
+	if err != nil {
+		return nil, d.Errf("invalid duration %q: %v", durationVal, err)
 	}
-	return rl
+	return &RateLimit{Limit: n, Duration: caddy.Duration(dur)}, nil
 }
 
 // Interface guards

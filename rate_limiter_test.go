@@ -88,8 +88,8 @@ func newTestRateLimiter(globalLimit, perDomainLimit *RateLimit, now func() time.
 		now:     now,
 	}
 	if globalLimit != nil {
-		s.globalLimits = []*RateLimit{globalLimit}
-		s.globals = []*slidingWindow{{}}
+		s.totalLimits = []*RateLimit{globalLimit}
+		s.totals = []*slidingWindow{{}}
 	}
 	if perDomainLimit != nil {
 		s.perDomainLimits = []*RateLimit{perDomainLimit}
@@ -99,19 +99,19 @@ func newTestRateLimiter(globalLimit, perDomainLimit *RateLimit, now func() time.
 
 func TestRateLimiter_GlobalCheckBeforeLimit(t *testing.T) {
 	rl := newTestRateLimiter(makeRateLimit(3, time.Hour), nil, time.Now)
-	rl.recordGlobal() // 1
-	rl.recordGlobal() // 2
-	if err := rl.checkGlobal(); err != nil {
+	rl.recordTotal() // 1
+	rl.recordTotal() // 2
+	if err := rl.checkTotal(); err != nil {
 		t.Errorf("expected no error at 2/3, got: %v", err)
 	}
 }
 
 func TestRateLimiter_GlobalCheckAtLimit(t *testing.T) {
 	rl := newTestRateLimiter(makeRateLimit(3, time.Hour), nil, time.Now)
-	rl.recordGlobal()
-	rl.recordGlobal()
-	rl.recordGlobal()
-	if err := rl.checkGlobal(); err == nil {
+	rl.recordTotal()
+	rl.recordTotal()
+	rl.recordTotal()
+	if err := rl.checkTotal(); err == nil {
 		t.Error("expected error at 3/3")
 	}
 }
@@ -119,11 +119,11 @@ func TestRateLimiter_GlobalCheckAtLimit(t *testing.T) {
 func TestRateLimiter_GlobalWindowExpiry(t *testing.T) {
 	start := time.Now()
 	rl := newTestRateLimiter(makeRateLimit(1, time.Hour), nil, func() time.Time { return start })
-	rl.recordGlobal()
+	rl.recordTotal()
 
 	// Advance past the window — the recorded entry should no longer count.
 	rl.now = func() time.Time { return start.Add(time.Hour + time.Second) }
-	if err := rl.checkGlobal(); err != nil {
+	if err := rl.checkTotal(); err != nil {
 		t.Errorf("expired entries should not be counted, got: %v", err)
 	}
 }
@@ -178,83 +178,37 @@ func TestRateLimiter_DifferentDomainsIndependent(t *testing.T) {
 	}
 }
 
-// --- RateLimit.resolve & validate -------------------------------------------
-
-func TestRateLimit_ResolveNilIsNoop(t *testing.T) {
-	var rl *RateLimit
-	if err := rl.resolve(caddy.NewReplacer(), "test"); err != nil {
-		t.Errorf("nil resolve should be noop, got: %v", err)
-	}
-}
-
-func TestRateLimit_ResolveEmptyRawIsNoop(t *testing.T) {
-	rl := &RateLimit{Limit: 5, Duration: caddy.Duration(time.Hour)}
-	if err := rl.resolve(caddy.NewReplacer(), "test"); err != nil {
-		t.Errorf("empty LimitRaw should be noop, got: %v", err)
-	}
-	if rl.Limit != 5 {
-		t.Error("Limit should be unchanged")
-	}
-}
-
-func TestRateLimit_ResolveRaw(t *testing.T) {
-	rl := &RateLimit{LimitRaw: "10", DurationRaw: "1h"}
-	if err := rl.resolve(caddy.NewReplacer(), "test"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if rl.Limit != 10 {
-		t.Errorf("Limit = %d, want 10", rl.Limit)
-	}
-	if time.Duration(rl.Duration) != time.Hour {
-		t.Errorf("Duration = %v, want 1h", time.Duration(rl.Duration))
-	}
-}
-
-func TestRateLimit_ResolveInvalidLimit(t *testing.T) {
-	rl := &RateLimit{LimitRaw: "notanumber", DurationRaw: "1h"}
-	if err := rl.resolve(caddy.NewReplacer(), "test"); err == nil {
-		t.Error("expected error for non-integer limit")
-	}
-}
-
-func TestRateLimit_ResolveInvalidDuration(t *testing.T) {
-	rl := &RateLimit{LimitRaw: "10", DurationRaw: "notaduration"}
-	if err := rl.resolve(caddy.NewReplacer(), "test"); err == nil {
-		t.Error("expected error for invalid duration")
-	}
-}
-
 func TestRateLimit_ValidateNilIsNoop(t *testing.T) {
 	var rl *RateLimit
-	if err := rl.validate("test"); err != nil {
+	if err := rl.validate(); err != nil {
 		t.Errorf("nil validate should be noop, got: %v", err)
 	}
 }
 
 func TestRateLimit_ValidateZeroLimit(t *testing.T) {
 	rl := &RateLimit{Limit: 0, Duration: caddy.Duration(time.Hour)}
-	if err := rl.validate("test"); err == nil {
+	if err := rl.validate(); err == nil {
 		t.Error("expected error for zero limit")
 	}
 }
 
 func TestRateLimit_ValidateNegativeLimit(t *testing.T) {
 	rl := &RateLimit{Limit: -1, Duration: caddy.Duration(time.Hour)}
-	if err := rl.validate("test"); err == nil {
+	if err := rl.validate(); err == nil {
 		t.Error("expected error for negative limit")
 	}
 }
 
 func TestRateLimit_ValidateZeroDuration(t *testing.T) {
 	rl := &RateLimit{Limit: 5, Duration: 0}
-	if err := rl.validate("test"); err == nil {
+	if err := rl.validate(); err == nil {
 		t.Error("expected error for zero duration")
 	}
 }
 
 func TestRateLimit_ValidateValid(t *testing.T) {
 	rl := &RateLimit{Limit: 5, Duration: caddy.Duration(time.Hour)}
-	if err := rl.validate("test"); err != nil {
+	if err := rl.validate(); err != nil {
 		t.Errorf("unexpected error for valid config: %v", err)
 	}
 }

@@ -81,8 +81,8 @@ func newTestIssuerWithLimits(inner certmagic.Issuer, globalRL, perDomainRL *Rate
 	iss := newTestIssuer(inner)
 	if globalRL != nil {
 		iss.RateLimit = []*RateLimit{globalRL}
-		iss.rateLimiter.globalLimits = iss.RateLimit
-		iss.rateLimiter.globals = []*slidingWindow{{}}
+		iss.rateLimiter.totalLimits = iss.RateLimit
+		iss.rateLimiter.totals = []*slidingWindow{{}}
 	}
 	if perDomainRL != nil {
 		iss.PerDomainRateLimit = []*RateLimit{perDomainRL}
@@ -151,7 +151,7 @@ func TestCheckRateLimits_NoLimits(t *testing.T) {
 
 func TestCheckRateLimits_LocalRateLimitExceeded(t *testing.T) {
 	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(1, time.Hour), nil)
-	iss.rateLimiter.recordGlobal()
+	iss.rateLimiter.recordTotal()
 
 	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
 		t.Error("expected local rate limit error")
@@ -180,7 +180,7 @@ func TestCheckRateLimits_SharedPoolExceeded(t *testing.T) {
 	iss := newTestIssuer(&stubIssuer{})
 	sp := makeSharedPool(t.Name(), 1, time.Hour)
 	entry := addSharedPool(t, iss, sp)
-	entry.state.recordGlobal()
+	entry.state.recordTotal()
 
 	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
 		t.Error("expected shared pool rate limit error")
@@ -210,7 +210,7 @@ func TestCheckRateLimits_LocalAndSharedCheckedIndependently(t *testing.T) {
 	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(10, time.Hour), nil)
 	sp := makeSharedPool(t.Name(), 1, time.Hour)
 	entry := addSharedPool(t, iss, sp)
-	entry.state.recordGlobal()
+	entry.state.recordTotal()
 
 	if err := iss.checkRateLimits([]string{"www.example.com"}); err == nil {
 		t.Error("expected error when shared pool is exceeded even though local has capacity")
@@ -243,7 +243,7 @@ func TestPreCheck_InnerPreCheckerError(t *testing.T) {
 func TestPreCheck_RateLimitBlocksBeforeInner(t *testing.T) {
 	inner := &preCheckerIssuer{}
 	iss := newTestIssuerWithLimits(inner, makeRateLimit(1, time.Hour), nil)
-	iss.rateLimiter.recordGlobal()
+	iss.rateLimiter.recordTotal()
 
 	if err := iss.PreCheck(context.Background(), []string{"www.example.com"}, false); err == nil {
 		t.Error("expected rate limit error")
@@ -255,7 +255,7 @@ func TestPreCheck_RateLimitBlocksBeforeInner(t *testing.T) {
 
 func TestPreCheck_RateLimitError_IsErrNoRetry(t *testing.T) {
 	iss := newTestIssuerWithLimits(&stubIssuer{}, makeRateLimit(1, time.Hour), nil)
-	iss.rateLimiter.recordGlobal()
+	iss.rateLimiter.recordTotal()
 
 	err := iss.PreCheck(context.Background(), []string{"www.example.com"}, false)
 	if err == nil {
@@ -294,7 +294,7 @@ func TestIssue_InnerError_NoCountRecorded(t *testing.T) {
 	}
 
 	iss.rateLimiter.mu.Lock()
-	globalCount := iss.rateLimiter.globals[0].count(time.Now(), time.Hour)
+	globalCount := iss.rateLimiter.totals[0].count(time.Now(), time.Hour)
 	_, hasDomain := iss.rateLimiter.domains["example.com"]
 	iss.rateLimiter.mu.Unlock()
 
@@ -314,7 +314,7 @@ func TestIssue_RecordsLocalCounters(t *testing.T) {
 	}
 
 	iss.rateLimiter.mu.Lock()
-	globalCount := iss.rateLimiter.globals[0].count(time.Now(), time.Duration(iss.RateLimit[0].Duration))
+	globalCount := iss.rateLimiter.totals[0].count(time.Now(), time.Duration(iss.RateLimit[0].Duration))
 	domainWindows, hasDomain := iss.rateLimiter.domains["example.com"]
 	var domainCount int
 	if hasDomain {
@@ -340,7 +340,7 @@ func TestIssue_RecordsSharedCounters(t *testing.T) {
 	}
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(time.Now(), time.Hour)
+	count := entry.state.totals[0].count(time.Now(), time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 1 {
@@ -354,7 +354,7 @@ func TestCleanup_SavesPoolState(t *testing.T) {
 	iss := newTestIssuer(&stubIssuer{})
 	sp := makeSharedPool(t.Name(), 10, time.Hour)
 	entry := addSharedPool(t, iss, sp)
-	entry.state.recordGlobal()
+	entry.state.recordTotal()
 
 	st := newMemStorage()
 	iss.storage = st
@@ -383,7 +383,7 @@ func TestSetConfig_LoadsPoolState(t *testing.T) {
 	st := newMemStorage()
 	now := time.Now()
 	entryA := newRegistryEntry(sp)
-	entryA.state.globals[0].add(now.Add(-20*time.Minute), time.Hour)
+	entryA.state.totals[0].add(now.Add(-20*time.Minute), time.Hour)
 	savePoolState(context.Background(), st, entryA, zap.NewNop())
 
 	// Create a fresh issuer and inject the pool (entry not yet loaded).
@@ -395,7 +395,7 @@ func TestSetConfig_LoadsPoolState(t *testing.T) {
 	iss.SetConfig(cfg)
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(now, time.Hour)
+	count := entry.state.totals[0].count(now, time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 1 {
@@ -410,7 +410,7 @@ func TestSetConfig_LoadsOnlyOnce(t *testing.T) {
 	st := newMemStorage()
 	now := time.Now()
 	entryA := newRegistryEntry(sp)
-	entryA.state.globals[0].add(now.Add(-20*time.Minute), time.Hour)
+	entryA.state.totals[0].add(now.Add(-20*time.Minute), time.Hour)
 	savePoolState(context.Background(), st, entryA, zap.NewNop())
 
 	iss := newTestIssuer(&stubIssuer{})
@@ -422,7 +422,7 @@ func TestSetConfig_LoadsOnlyOnce(t *testing.T) {
 	iss.SetConfig(cfg) // second call must not double-apply
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(now, time.Hour)
+	count := entry.state.totals[0].count(now, time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 1 {

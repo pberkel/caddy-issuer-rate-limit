@@ -16,7 +16,6 @@ package ratelimitissuer
 
 import (
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -30,14 +29,6 @@ type RateLimit struct {
 	Limit int `json:"limit,omitempty"`
 	// Rolling time window for the rate limit.
 	Duration caddy.Duration `json:"duration,omitempty"`
-
-	// LimitRaw and DurationRaw hold raw string values set during Caddyfile
-	// parsing; they may contain Caddy placeholders resolved at provisioning
-	// time. When non-empty, they take precedence over Limit and Duration and
-	// must survive JSON serialization so that the Caddyfile → JSON → provision
-	// round-trip preserves placeholder expressions.
-	LimitRaw    string `json:"limit_raw,omitempty"`
-	DurationRaw string `json:"duration_raw,omitempty"`
 }
 
 // rateLimitState holds in-memory exact sliding-window counters for global and
@@ -45,9 +36,9 @@ type RateLimit struct {
 // that multiple tiered limits can be enforced simultaneously.
 type rateLimitState struct {
 	mu              sync.Mutex
-	globals         []*slidingWindow
+	totals          []*slidingWindow
 	domains         map[string][]*slidingWindow
-	globalLimits    []*RateLimit
+	totalLimits     []*RateLimit
 	perDomainLimits []*RateLimit
 	now             func() time.Time
 }
@@ -87,26 +78,26 @@ func (w *slidingWindow) add(now time.Time, d time.Duration) {
 	w.timestamps = append(w.timestamps, now)
 }
 
-// checkGlobal returns an error if any global rate limit window is exceeded.
-func (s *rateLimitState) checkGlobal() error {
+// checkTotal returns an error if any global rate limit window is exceeded.
+func (s *rateLimitState) checkTotal() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	for i, rl := range s.globalLimits {
-		if s.globals[i].count(now, time.Duration(rl.Duration)) >= rl.Limit {
+	for i, rl := range s.totalLimits {
+		if s.totals[i].count(now, time.Duration(rl.Duration)) >= rl.Limit {
 			return fmt.Errorf("global certificate issuance rate limit exceeded")
 		}
 	}
 	return nil
 }
 
-// recordGlobal increments all global issuance windows.
-func (s *rateLimitState) recordGlobal() {
+// recordTotal increments all global issuance windows.
+func (s *rateLimitState) recordTotal() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	for i, rl := range s.globalLimits {
-		s.globals[i].add(now, time.Duration(rl.Duration))
+	for i, rl := range s.totalLimits {
+		s.totals[i].add(now, time.Duration(rl.Duration))
 	}
 }
 
@@ -155,39 +146,17 @@ func (s *rateLimitState) recordDomain(domain string) {
 	}
 }
 
-// resolve replaces Caddy placeholders in LimitRaw and DurationRaw and stores
-// the parsed values in Limit and Duration. It is a no-op when rl is nil or
-// LimitRaw is empty.
-func (rl *RateLimit) resolve(replacer *caddy.Replacer, name string) error {
-	if rl == nil || rl.LimitRaw == "" {
-		return nil
-	}
-	limitStr := replacer.ReplaceAll(rl.LimitRaw, "")
-	limit, err := strconv.Atoi(limitStr)
-	if err != nil {
-		return fmt.Errorf("invalid integer value for %s limit: %s", name, limitStr)
-	}
-	durStr := replacer.ReplaceAll(rl.DurationRaw, "")
-	dur, err := caddy.ParseDuration(durStr)
-	if err != nil {
-		return fmt.Errorf("invalid duration value for %s: %s", name, durStr)
-	}
-	rl.Limit = limit
-	rl.Duration = caddy.Duration(dur)
-	return nil
-}
-
 // validate returns an error if the rate limit configuration is invalid.
 // It is a no-op when rl is nil.
-func (rl *RateLimit) validate(name string) error {
+func (rl *RateLimit) validate() error {
 	if rl == nil {
 		return nil
 	}
 	if rl.Limit <= 0 {
-		return fmt.Errorf("%s limit must be greater than 0, got %d", name, rl.Limit)
+		return fmt.Errorf("limit must be greater than 0, got %d", rl.Limit)
 	}
 	if time.Duration(rl.Duration) <= 0 {
-		return fmt.Errorf("%s duration must be greater than 0", name)
+		return fmt.Errorf("duration must be greater than 0")
 	}
 	return nil
 }

@@ -21,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 )
@@ -167,7 +166,7 @@ func TestGetOrRegisterPool_ResetOnLimitMismatch(t *testing.T) {
 	t.Cleanup(func() { processRegistry.Delete(t.Name()) })
 
 	e1 := getOrRegisterPool(sp1, zap.NewNop())
-	e1.state.recordGlobal() // record so we can detect reset
+	e1.state.recordTotal() // record so we can detect reset
 
 	e2 := getOrRegisterPool(sp2, zap.NewNop())
 	if e1 == e2 {
@@ -176,7 +175,7 @@ func TestGetOrRegisterPool_ResetOnLimitMismatch(t *testing.T) {
 
 	// new entry should start with empty windows
 	e2.state.mu.Lock()
-	count := e2.state.globals[0].count(time.Now(), time.Hour)
+	count := e2.state.totals[0].count(time.Now(), time.Hour)
 	e2.state.mu.Unlock()
 	if count != 0 {
 		t.Errorf("reset entry global count = %d, want 0", count)
@@ -232,7 +231,7 @@ func TestApplyPersistedState_GlobalTimestamps(t *testing.T) {
 	applyPersistedState(entry.state, ps)
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(now, time.Hour)
+	count := entry.state.totals[0].count(now, time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 2 {
@@ -251,7 +250,7 @@ func TestApplyPersistedState_ExpiredTimestampsIgnored(t *testing.T) {
 	applyPersistedState(entry.state, ps)
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(now, time.Hour)
+	count := entry.state.totals[0].count(now, time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 0 {
@@ -274,7 +273,7 @@ func TestApplyPersistedState_ExtraWindowsIgnored(t *testing.T) {
 	applyPersistedState(entry.state, ps)
 
 	entry.state.mu.Lock()
-	count := entry.state.globals[0].count(now, time.Hour)
+	count := entry.state.totals[0].count(now, time.Hour)
 	entry.state.mu.Unlock()
 
 	if count != 1 {
@@ -318,8 +317,8 @@ func TestSaveAndLoad_GlobalRoundtrip(t *testing.T) {
 
 	entry := newRegistryEntry(sp)
 	now := time.Now()
-	entry.state.globals[0].add(now.Add(-30*time.Minute), time.Hour)
-	entry.state.globals[0].add(now.Add(-10*time.Minute), time.Hour)
+	entry.state.totals[0].add(now.Add(-30*time.Minute), time.Hour)
+	entry.state.totals[0].add(now.Add(-10*time.Minute), time.Hour)
 
 	st := newMemStorage()
 	logger := zap.NewNop()
@@ -332,7 +331,7 @@ func TestSaveAndLoad_GlobalRoundtrip(t *testing.T) {
 	entry2.mu.Unlock()
 
 	entry2.state.mu.Lock()
-	count := entry2.state.globals[0].count(now, time.Hour)
+	count := entry2.state.totals[0].count(now, time.Hour)
 	entry2.state.mu.Unlock()
 
 	if count != 2 {
@@ -346,8 +345,8 @@ func TestSaveAndLoad_ExpiredPruned(t *testing.T) {
 
 	entry := newRegistryEntry(sp)
 	now := time.Now()
-	entry.state.globals[0].add(now.Add(-2*time.Hour), time.Hour) // will be expired at save time
-	entry.state.globals[0].add(now.Add(-30*time.Minute), time.Hour)
+	entry.state.totals[0].add(now.Add(-2*time.Hour), time.Hour) // will be expired at save time
+	entry.state.totals[0].add(now.Add(-30*time.Minute), time.Hour)
 
 	st := newMemStorage()
 	logger := zap.NewNop()
@@ -362,7 +361,7 @@ func TestSaveAndLoad_ExpiredPruned(t *testing.T) {
 	entry2.mu.Unlock()
 
 	entry2.state.mu.Lock()
-	count := entry2.state.globals[0].count(now, time.Hour)
+	count := entry2.state.totals[0].count(now, time.Hour)
 	entry2.state.mu.Unlock()
 
 	if count != 1 {
@@ -391,13 +390,6 @@ func TestSharedPool_Validate_EmptyLimits(t *testing.T) {
 func TestSharedPool_Validate_Valid(t *testing.T) {
 	sp := makeSharedPool("x", 10, time.Hour)
 	if err := sp.validate(); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestSharedPool_Resolve_Noop(t *testing.T) {
-	sp := makeSharedPool("x", 10, time.Hour)
-	if err := sp.resolve(caddy.NewReplacer()); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

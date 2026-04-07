@@ -16,6 +16,7 @@ package ratelimitissuer
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +27,6 @@ import (
 
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
-
-	"github.com/caddyserver/caddy/v2"
 )
 
 // SharedPool defines rate limits for a named pool that can be shared across
@@ -58,21 +57,6 @@ type SharedPool struct {
 	PerDomainRateLimit []*RateLimit `json:"per_domain_rate_limit,omitempty"`
 }
 
-func (sp *SharedPool) resolve(repl *caddy.Replacer) error {
-	prefix := fmt.Sprintf("shared[%q]", sp.Name)
-	for _, rl := range sp.RateLimit {
-		if err := rl.resolve(repl, prefix+".rate_limit"); err != nil {
-			return err
-		}
-	}
-	for _, rl := range sp.PerDomainRateLimit {
-		if err := rl.resolve(repl, prefix+".per_domain_rate_limit"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (sp *SharedPool) validate() error {
 	if err := validatePoolName(sp.Name); err != nil {
 		return err
@@ -82,16 +66,25 @@ func (sp *SharedPool) validate() error {
 	}
 	prefix := fmt.Sprintf("shared[%q]", sp.Name)
 	for _, rl := range sp.RateLimit {
-		if err := rl.validate(prefix + ".rate_limit"); err != nil {
-			return err
+		if err := rl.validate(); err != nil {
+			return fmt.Errorf("%s.rate_limit: %w", prefix, err)
 		}
 	}
 	for _, rl := range sp.PerDomainRateLimit {
-		if err := rl.validate(prefix + ".per_domain_rate_limit"); err != nil {
-			return err
+		if err := rl.validate(); err != nil {
+			return fmt.Errorf("%s.per_domain_rate_limit: %w", prefix, err)
 		}
 	}
 	return nil
+}
+
+// newUUID returns a random UUID (version 4) string.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // validatePoolName returns an error if name is unsuitable as a storage path
@@ -106,15 +99,22 @@ func validatePoolName(name string) error {
 	return nil
 }
 
-// registryEntry is a process-lifetime record for a named shared pool.
+// registryEntry is the process-lifetime record for a rate limit pool. Shared
+// pool entries (local == false) persist for the lifetime of the process;
+// local instance entries (local == true) are removed from processRegistry when
+// the owning RateLimitIssuer is cleaned up.
 type registryEntry struct {
 	mu     sync.Mutex
 	state  *rateLimitState
-	pool   *SharedPool
-	loaded bool // true once persisted state has been applied from storage
+	pool   *SharedPool // nil for local instances
+	loaded bool        // true once persisted state has been applied from storage
+	local  bool        // true for local (non-shared) instances
 }
 
-// processRegistry holds named pool entries keyed by pool name.
+// processRegistry holds all rate limit entries keyed by name. Shared pool
+// entries are keyed by their user-defined pool name and persist for the
+// lifetime of the process. Local instance entries are keyed by a UUID assigned
+// at Provision time and removed at Cleanup.
 var processRegistry sync.Map // map[string]*registryEntry
 
 // getOrRegisterPool returns the registry entry for sp.Name, creating one if
@@ -134,15 +134,15 @@ func getOrRegisterPool(sp *SharedPool, logger *zap.Logger) *registryEntry {
 }
 
 func newRegistryEntry(sp *SharedPool) *registryEntry {
-	globals := make([]*slidingWindow, len(sp.RateLimit))
-	for i := range globals {
-		globals[i] = &slidingWindow{}
+	totals := make([]*slidingWindow, len(sp.RateLimit))
+	for i := range totals {
+		totals[i] = &slidingWindow{}
 	}
 	return &registryEntry{
 		state: &rateLimitState{
-			globalLimits:    sp.RateLimit,
+			totalLimits:     sp.RateLimit,
 			perDomainLimits: sp.PerDomainRateLimit,
-			globals:         globals,
+			totals:          totals,
 			domains:         make(map[string][]*slidingWindow),
 			now:             time.Now,
 		},
@@ -209,9 +209,9 @@ func loadAndApplyPoolState(ctx context.Context, storage certmagic.Storage, entry
 func applyPersistedState(state *rateLimitState, ps *persistedPoolState) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	for i := range state.globals {
+	for i := range state.totals {
 		if i < len(ps.Global) {
-			state.globals[i].timestamps = append(state.globals[i].timestamps, ps.Global[i]...)
+			state.totals[i].timestamps = append(state.totals[i].timestamps, ps.Global[i]...)
 		}
 	}
 	for domain, windowTimestamps := range ps.Domains {
@@ -238,9 +238,9 @@ func savePoolState(ctx context.Context, storage certmagic.Storage, entry *regist
 
 	global := make([][]time.Time, len(entry.pool.RateLimit))
 	for i, rl := range entry.pool.RateLimit {
-		entry.state.globals[i].trim(now, time.Duration(rl.Duration))
-		ts := make([]time.Time, len(entry.state.globals[i].timestamps))
-		copy(ts, entry.state.globals[i].timestamps)
+		entry.state.totals[i].trim(now, time.Duration(rl.Duration))
+		ts := make([]time.Time, len(entry.state.totals[i].timestamps))
+		copy(ts, entry.state.totals[i].timestamps)
 		global[i] = ts
 	}
 

@@ -66,9 +66,6 @@ func init() {
 // share in-memory sliding windows. Shared pool state is persisted to Caddy's
 // configured storage backend and restored on startup.
 //
-// Use the conventional pool name "global" to create a process-wide limit that
-// all rate_limit instances participate in.
-//
 // EXPERIMENTAL: Subject to change.
 type RateLimitIssuer struct {
 	// The inner issuer to delegate certificate issuance to.
@@ -91,11 +88,17 @@ type RateLimitIssuer struct {
 	// persisted across restarts.
 	SharedPools []*SharedPool `json:"shared_pools,omitempty"`
 
+	// Optional stable identifier for this instance, used as the key in the
+	// admin registry. If omitted, a UUID is generated at provision time.
+	// Useful for distinguishing multiple local instances in the admin UI.
+	InstanceID string `json:"instance_id,omitempty"`
+
 	issuer         certmagic.Issuer
 	logger         *zap.Logger
 	rateLimiter    *rateLimitState           // local limiter
 	sharedLimiters map[string]*registryEntry // keyed by pool name
 	storage        certmagic.Storage         // for shared pool persistence
+	instanceID     string                    // admin registry key, set at Provision
 }
 
 // CaddyModule returns the Caddy module information.
@@ -110,43 +113,35 @@ func (RateLimitIssuer) CaddyModule() caddy.ModuleInfo {
 func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 	iss.logger = ctx.Logger()
 
-	repl := caddy.NewReplacer()
-
+	// Validate local rate limit configs.
 	for _, rl := range iss.RateLimit {
-		if err := rl.resolve(repl, "rate_limit"); err != nil {
-			return err
-		}
-		if err := rl.validate("rate_limit"); err != nil {
-			return err
+		if err := rl.validate(); err != nil {
+			return fmt.Errorf("rate_limit: %w", err)
 		}
 	}
 	for _, rl := range iss.PerDomainRateLimit {
-		if err := rl.resolve(repl, "per_domain_rate_limit"); err != nil {
-			return err
-		}
-		if err := rl.validate("per_domain_rate_limit"); err != nil {
-			return err
+		if err := rl.validate(); err != nil {
+			return fmt.Errorf("per_domain_rate_limit: %w", err)
 		}
 	}
 
-	globals := make([]*slidingWindow, len(iss.RateLimit))
-	for i := range globals {
-		globals[i] = &slidingWindow{}
+	// Initialise local in-memory sliding windows (one per configured limit).
+	totalWindows := make([]*slidingWindow, len(iss.RateLimit))
+	for i := range totalWindows {
+		totalWindows[i] = &slidingWindow{}
 	}
 	iss.rateLimiter = &rateLimitState{
-		globalLimits:    iss.RateLimit,
+		totalLimits:     iss.RateLimit,
 		perDomainLimits: iss.PerDomainRateLimit,
-		globals:         globals,
+		totals:          totalWindows,
 		domains:         make(map[string][]*slidingWindow),
 		now:             time.Now,
 	}
 
+	// Validate shared pool configs and obtain (or create) their registry entries.
 	seen := make(map[string]struct{}, len(iss.SharedPools))
 	iss.sharedLimiters = make(map[string]*registryEntry, len(iss.SharedPools))
 	for _, sp := range iss.SharedPools {
-		if err := sp.resolve(repl); err != nil {
-			return err
-		}
 		if err := sp.validate(); err != nil {
 			return err
 		}
@@ -157,6 +152,7 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 		iss.sharedLimiters[sp.Name] = getOrRegisterPool(sp, iss.logger)
 	}
 
+	// Load and wire up the inner issuer module.
 	if iss.IssuerRaw != nil {
 		val, err := ctx.LoadModule(iss, "IssuerRaw")
 		if err != nil {
@@ -166,6 +162,30 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 	}
 	if iss.issuer == nil {
 		return fmt.Errorf("inner issuer is required")
+	}
+
+	// Register local limiter in the admin registry so the admin handler can
+	// expose it alongside shared pools. Use the configured InstanceID if
+	// provided, otherwise generate a UUID.
+	if len(iss.RateLimit) > 0 || len(iss.PerDomainRateLimit) > 0 {
+		entry := &registryEntry{
+			state: iss.rateLimiter,
+			local: true,
+		}
+		if iss.InstanceID != "" {
+			if _, loaded := processRegistry.LoadOrStore(iss.InstanceID, entry); loaded {
+				return fmt.Errorf("instance_id %q is already in use by another rate_limit instance", iss.InstanceID)
+			}
+			iss.instanceID = iss.InstanceID
+		} else {
+			for {
+				id := newUUID()
+				if _, loaded := processRegistry.LoadOrStore(id, entry); !loaded {
+					iss.instanceID = id
+					break
+				}
+			}
+		}
 	}
 
 	poolNames := make([]string, 0, len(iss.SharedPools))
@@ -203,9 +223,13 @@ func (iss *RateLimitIssuer) SetConfig(cfg *certmagic.Config) {
 	}
 }
 
-// Cleanup implements caddy.CleanerUpper. It persists shared pool state to
-// storage. Errors are logged but do not prevent cleanup.
+// Cleanup implements caddy.CleanerUpper. It removes the local limiter entry
+// from processRegistry and persists shared pool state to storage. Errors are
+// logged but do not prevent cleanup.
 func (iss *RateLimitIssuer) Cleanup() error {
+	if iss.instanceID != "" {
+		processRegistry.Delete(iss.instanceID)
+	}
 	if iss.storage == nil || len(iss.sharedLimiters) == 0 {
 		return nil
 	}
@@ -284,8 +308,8 @@ func (iss *RateLimitIssuer) checkRateLimits(names []string) error {
 
 // checkLimiter checks all windows in a single rateLimitState.
 func (iss *RateLimitIssuer) checkLimiter(s *rateLimitState, names []string) error {
-	if len(s.globalLimits) > 0 {
-		if err := s.checkGlobal(); err != nil {
+	if len(s.totalLimits) > 0 {
+		if err := s.checkTotal(); err != nil {
 			return err
 		}
 	}
@@ -310,8 +334,8 @@ func (iss *RateLimitIssuer) recordIssuance(names []string) {
 
 // recordLimiter records an issuance in a single rateLimitState.
 func (iss *RateLimitIssuer) recordLimiter(s *rateLimitState, names []string) {
-	if len(s.globalLimits) > 0 {
-		s.recordGlobal()
+	if len(s.totalLimits) > 0 {
+		s.recordTotal()
 	}
 	if len(s.perDomainLimits) > 0 {
 		for _, domain := range iss.uniqueDomains(names) {
