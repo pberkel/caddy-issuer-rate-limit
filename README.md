@@ -14,8 +14,13 @@ This module enforces limits at issuance time — after `SubjectTransformer` has 
 
 The module wraps an inner issuer and intercepts the issuance lifecycle at two points:
 
-1. **`PreCheck`** — fast in-memory checks (rate limit windows) reject requests before the inner issuer sets up challenge infrastructure.
+1. **`PreCheck`** — fast in-memory checks (rate limit windows) reject requests before the inner issuer sets up challenge infrastructure. Rate limit errors are wrapped in `certmagic.ErrNoRetry` so the TLS handshake fails immediately rather than blocking in certmagic's obtain loop.
 2. **`Issue`** — delegates to the inner issuer. Counters are recorded **only on successful issuance**; a failed issuance does not consume a slot.
+
+Other certmagic interfaces are delegated to the inner issuer transparently:
+
+- **ARI** (`GetRenewalInfo`) — ACME Renewal Information (RFC 8739) is forwarded if the inner issuer supports it.
+- **Revocation** (`Revoke`) — certificate revocation is forwarded if the inner issuer supports it.
 
 ## Installation
 
@@ -63,10 +68,18 @@ xcaddy build \
 #### Syntax
 
 ```
-issuer rate_limit {
-    ...
+issuer rate_limit [<id>] {
+    issuer <module> { ... }
+    rate_limit <limit> <duration>
+    per_domain_rate_limit <limit> <duration>
+    shared <name> {
+        rate_limit <limit> <duration>
+        per_domain_rate_limit <limit> <duration>
+    }
 }
 ```
+
+The optional `<id>` is a stable identifier for this instance used as the key in the admin registry (see [Admin API](#admin-api)). If omitted, a UUID is generated at provision time. Must be unique across all `rate_limit` issuer instances in the process.
 
 #### Subdirectives
 
@@ -103,6 +116,7 @@ issuer rate_limit {
             "issuers": [
               {
                 "module": "rate_limit",
+                "instance_id": "primary",
                 "issuer": {
                   "module": "acme",
                   "ca": "https://acme-v02.api.letsencrypt.org/directory"
@@ -136,6 +150,8 @@ issuer rate_limit {
 }
 ```
 
+Duration values are in nanoseconds.
+
 ## Rate limit behaviour
 
 Rate limits are enforced per registrable domain (eTLD+1). Because limits apply after `SubjectTransformer` has run, hostnames that map to the same wildcard certificate share a single slot:
@@ -146,6 +162,10 @@ Rate limits are enforced per registrable domain (eTLD+1). Because limits apply a
 ### Tiered limits
 
 Both `rate_limit` and `per_domain_rate_limit` may be specified multiple times. Each entry defines an independent sliding window — an issuance must fit within **all** configured windows to proceed. This enables tiered constraints such as "no more than 5 per domain per 6 hours, and no more than 20 per domain per day".
+
+### Memory management
+
+Per-domain sliding windows are held in memory for the duration of their configured window. A background goroutine runs hourly to evict entries whose windows have fully expired, keeping memory usage proportional to the number of domains with recent issuance activity.
 
 ## Shared pools
 
@@ -165,6 +185,47 @@ shared global {
 **Limit changes:** if a pool's limits are changed across a config reload, the in-memory state is reset and a warning is logged.
 
 **Persistence:** shared pool state is saved to Caddy's configured storage backend on shutdown and config reload, and restored on startup. Storage key: `tls_issuer_rate_limit/pools/<name>.json`. Expired timestamps are pruned before saving.
+
+## Admin API
+
+This module registers an admin API handler (`admin.api.rate_limit_issuer`) that exposes rate limit state for all local instances and shared pools in the process.
+
+### Routes
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/rate_limit_issuer/` | Self-contained web interface |
+| `GET` | `/rate_limit_issuer/pools` | JSON status of all instances and pools |
+| `DELETE` | `/rate_limit_issuer/pools/<name>/total` | Reset total (cross-domain) windows |
+| `DELETE` | `/rate_limit_issuer/pools/<name>/domains/<domain>` | Reset per-domain windows for one domain |
+| `DELETE` | `/rate_limit_issuer/pools/<name>` | Reset all windows (total and per-domain) |
+
+The `<name>` for a local instance is its configured `instance_id`, or the auto-generated UUID if none was set.
+
+### Accessing the admin UI via a site block
+
+Caddy's admin API listens on `localhost:2019` by default and is not directly exposed. To proxy it through a site block with authentication:
+
+```caddyfile
+{
+    admin localhost:2019 {
+        origins admin.example.com
+    }
+}
+
+admin.example.com {
+    handle_path /admin/* {
+        basic_auth {
+            alice $2a$14$...
+        }
+        reverse_proxy localhost:2019 {
+            header_up Host admin.example.com
+        }
+    }
+}
+```
+
+`handle_path` strips the `/admin` prefix before proxying, so `/admin/rate_limit_issuer/` is forwarded as `/rate_limit_issuer/`. The `origins` directive allows the admin API to accept requests with that `Host` header.
 
 ## Recommended usage with caddy-tls-permission-policy
 
