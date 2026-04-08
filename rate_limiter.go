@@ -71,6 +71,16 @@ func (w *slidingWindow) count(now time.Time, d time.Duration) int {
 	return len(w.timestamps)
 }
 
+// resetAt returns the time at which the oldest entry expires from the window,
+// i.e. when the count will next decrease by one. Returns the zero time if the
+// window is empty. Must be called after trim for accuracy.
+func (w *slidingWindow) resetAt(d time.Duration) time.Time {
+	if len(w.timestamps) == 0 {
+		return time.Time{}
+	}
+	return w.timestamps[0].Add(d)
+}
+
 // add records a new issuance at now, trimming expired entries first.
 func (w *slidingWindow) add(now time.Time, d time.Duration) {
 	w.trim(now, d)

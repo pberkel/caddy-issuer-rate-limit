@@ -92,9 +92,10 @@ func (a RateLimitAdmin) handleRequest(w http.ResponseWriter, r *http.Request) er
 
 // WindowStatus is the serialisable view of a single sliding window.
 type WindowStatus struct {
-	Limit    int    `json:"limit"`
-	Duration string `json:"duration"`
-	Count    int    `json:"count"`
+	Limit    int        `json:"limit"`
+	Duration string     `json:"duration"`
+	Count    int        `json:"count"`
+	ResetAt  *time.Time `json:"reset_at,omitempty"`
 }
 
 // PoolStatus is the serialisable view of a pool entry. Kind is "shared" for
@@ -178,11 +179,16 @@ func entryToStatus(name string, entry *registryEntry) PoolStatus {
 
 	for i, rl := range s.totalLimits {
 		d := time.Duration(rl.Duration)
-		ps.Total = append(ps.Total, WindowStatus{
+		_ = s.totals[i].count(now, d) // trim before resetAt
+		ws := WindowStatus{
 			Limit:    rl.Limit,
 			Duration: d.String(),
-			Count:    s.totals[i].count(now, d),
-		})
+			Count:    len(s.totals[i].timestamps),
+		}
+		if t := s.totals[i].resetAt(d); !t.IsZero() {
+			ws.ResetAt = &t
+		}
+		ps.Total = append(ps.Total, ws)
 	}
 
 	if len(s.domains) > 0 {
@@ -191,10 +197,14 @@ func entryToStatus(name string, entry *registryEntry) PoolStatus {
 			ws := make([]WindowStatus, len(s.perDomainLimits))
 			for i, rl := range s.perDomainLimits {
 				d := time.Duration(rl.Duration)
+				_ = windows[i].count(now, d) // trim before resetAt
 				ws[i] = WindowStatus{
 					Limit:    rl.Limit,
 					Duration: d.String(),
-					Count:    windows[i].count(now, d),
+					Count:    len(windows[i].timestamps),
+				}
+				if t := windows[i].resetAt(d); !t.IsZero() {
+					ws[i].ResetAt = &t
 				}
 			}
 			ps.Domains[domain] = ws
@@ -280,6 +290,16 @@ function windowBar(w) {
   const pct = Math.min(100, Math.round(w.count / w.limit * 100));
   return '<div class="bar-wrap"><div class="bar"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div></div>';
 }
+function fmtReset(iso) {
+  if (!iso) return '\u2014';
+  const diff = new Date(iso) - Date.now();
+  if (diff <= 0) return 'now';
+  const s = Math.ceil(diff / 1000);
+  if (s < 60) return 'in ' + s + 's';
+  const m = Math.ceil(s / 60);
+  if (m < 60) return 'in ' + m + 'm';
+  return 'in ' + Math.ceil(m / 60) + 'h';
+}
 function renderGlobal(name, windows) {
   if (!windows || windows.length === 0) return '';
   const first = windows[0] || {count:0,limit:1,duration:''};
@@ -287,9 +307,10 @@ function renderGlobal(name, windows) {
     '<td class="count-cell">' + windows.map(w => w.count+'/'+w.limit).join(', ') + '</td>' +
     '<td>' + windows.map(w => esc(w.duration)).join(', ') + '</td>' +
     '<td>' + windowBar(first) + '</td>' +
+    '<td>' + windows.map(w => fmtReset(w.reset_at)).join(', ') + '</td>' +
     '<td><button onclick="resetTotal(' + jsonAttr(name) + ')">Reset</button></td></tr>';
   return '<div class="section-label">Total</div>' +
-    '<table><thead><tr><th>Count / Limit</th><th>Window</th><th></th><th></th></tr></thead><tbody>' + row + '</tbody></table>';
+    '<table><thead><tr><th>Count / Limit</th><th>Window</th><th></th><th>Resets</th><th></th></tr></thead><tbody>' + row + '</tbody></table>';
 }
 function renderDomains(name, domains) {
   if (!domains || Object.keys(domains).length === 0) return '';
@@ -300,10 +321,11 @@ function renderDomains(name, domains) {
       '<td class="count-cell">' + windows.map(w => w.count+'/'+w.limit).join(', ') + '</td>' +
       '<td>' + windows.map(w => esc(w.duration)).join(', ') + '</td>' +
       '<td>' + windowBar(first) + '</td>' +
+      '<td>' + windows.map(w => fmtReset(w.reset_at)).join(', ') + '</td>' +
       '<td><button onclick="resetDomain(' + jsonAttr(name) + ',' + jsonAttr(domain) + ')">Reset</button></td></tr>';
   }).join('');
   return '<div class="section-label">Per Domain</div>' +
-    '<table><thead><tr><th>Domain</th><th>Count / Limit</th><th>Window</th><th></th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+    '<table><thead><tr><th>Domain</th><th>Count / Limit</th><th>Window</th><th></th><th>Resets</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 function renderGroup(items, containerID, emptyMsg) {
   const el = document.getElementById(containerID);
