@@ -15,6 +15,7 @@
 package ratelimitissuer
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -41,6 +42,7 @@ type rateLimitState struct {
 	totalLimits     []*RateLimit
 	perDomainLimits []*RateLimit
 	now             func() time.Time
+	stopEviction    func() // non-nil when a background eviction goroutine is running
 }
 
 // slidingWindow tracks exact issuance timestamps within a rolling time window.
@@ -152,6 +154,47 @@ func (s *rateLimitState) recordDomain(domain string) {
 	now := s.now()
 	for i, rl := range s.perDomainLimits {
 		windows[i].add(now, time.Duration(rl.Duration))
+	}
+}
+
+// startEviction starts a background goroutine that evicts expired per-domain
+// windows at the given interval. Call stopEviction to stop it.
+func (s *rateLimitState) startEviction(interval time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.stopEviction = cancel
+	go s.evictLoop(ctx, interval)
+}
+
+func (s *rateLimitState) evictLoop(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.evictExpiredDomains()
+		}
+	}
+}
+
+// evictExpiredDomains removes per-domain entries whose windows are entirely
+// expired. It is safe to call concurrently with check and record operations.
+func (s *rateLimitState) evictExpiredDomains() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for domain, windows := range s.domains {
+		allEmpty := true
+		for i, rl := range s.perDomainLimits {
+			windows[i].trim(now, time.Duration(rl.Duration))
+			if len(windows[i].timestamps) > 0 {
+				allEmpty = false
+			}
+		}
+		if allEmpty {
+			delete(s.domains, domain)
+		}
 	}
 }
 

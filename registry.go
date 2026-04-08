@@ -127,8 +127,17 @@ func getOrRegisterPool(sp *SharedPool, logger *zap.Logger) *registryEntry {
 	if loaded && !poolLimitsMatch(entry.pool, sp) {
 		logger.Warn("shared pool limits changed; resetting rate limit state",
 			zap.String("pool", sp.Name))
+		if entry.state.stopEviction != nil {
+			entry.state.stopEviction()
+		}
+		if len(sp.PerDomainRateLimit) > 0 {
+			candidate.state.startEviction(time.Hour)
+		}
 		processRegistry.Store(sp.Name, candidate)
 		return candidate
+	}
+	if !loaded && len(sp.PerDomainRateLimit) > 0 {
+		candidate.state.startEviction(time.Hour)
 	}
 	return entry
 }

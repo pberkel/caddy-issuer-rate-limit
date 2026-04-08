@@ -251,6 +251,7 @@ button { padding: 4px 12px; border: 1px solid #ddd; border-radius: 5px; backgrou
 button:hover { background: #f7f7f7; }
 button.danger { border-color: #e53935; color: #e53935; }
 button.danger:hover { background: #fff5f5; }
+td.action { text-align: right; }
 .group { margin-bottom: 2rem; }
 .empty { color: #bbb; font-size: 0.9rem; padding: 0.5rem 0 1.5rem; }
 </style>
@@ -308,7 +309,7 @@ function renderGlobal(name, windows) {
     '<td>' + windows.map(w => esc(w.duration)).join(', ') + '</td>' +
     '<td>' + windowBar(first) + '</td>' +
     '<td>' + windows.map(w => fmtReset(w.reset_at)).join(', ') + '</td>' +
-    '<td><button onclick="resetTotal(' + jsonAttr(name) + ')">Reset</button></td></tr>';
+    '<td class="action"><button onclick="resetTotal(' + jsonAttr(name) + ')">Reset</button></td></tr>';
   return '<div class="section-label">Total</div>' +
     '<table><thead><tr><th>Count / Limit</th><th>Window</th><th></th><th>Resets</th><th></th></tr></thead><tbody>' + row + '</tbody></table>';
 }
@@ -322,7 +323,7 @@ function renderDomains(name, domains) {
       '<td>' + windows.map(w => esc(w.duration)).join(', ') + '</td>' +
       '<td>' + windowBar(first) + '</td>' +
       '<td>' + windows.map(w => fmtReset(w.reset_at)).join(', ') + '</td>' +
-      '<td><button onclick="resetDomain(' + jsonAttr(name) + ',' + jsonAttr(domain) + ')">Reset</button></td></tr>';
+      '<td class="action"><button onclick="resetDomain(' + jsonAttr(name) + ',' + jsonAttr(domain) + ')">Reset</button></td></tr>';
   }).join('');
   return '<div class="section-label">Per Domain</div>' +
     '<table><thead><tr><th>Domain</th><th>Count / Limit</th><th>Window</th><th></th><th>Resets</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';

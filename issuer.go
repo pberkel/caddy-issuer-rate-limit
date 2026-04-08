@@ -138,6 +138,11 @@ func (iss *RateLimitIssuer) Provision(ctx caddy.Context) error {
 		now:             time.Now,
 	}
 
+	// Start background eviction of expired per-domain entries.
+	if len(iss.PerDomainRateLimit) > 0 {
+		iss.rateLimiter.startEviction(time.Hour)
+	}
+
 	// Validate shared pool configs and obtain (or create) their registry entries.
 	seen := make(map[string]struct{}, len(iss.SharedPools))
 	iss.sharedLimiters = make(map[string]*registryEntry, len(iss.SharedPools))
@@ -227,6 +232,9 @@ func (iss *RateLimitIssuer) SetConfig(cfg *certmagic.Config) {
 // from processRegistry and persists shared pool state to storage. Errors are
 // logged but do not prevent cleanup.
 func (iss *RateLimitIssuer) Cleanup() error {
+	if iss.rateLimiter.stopEviction != nil {
+		iss.rateLimiter.stopEviction()
+	}
 	if iss.instanceID != "" {
 		processRegistry.Delete(iss.instanceID)
 	}

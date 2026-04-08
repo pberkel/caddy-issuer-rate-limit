@@ -178,6 +178,42 @@ func TestRateLimiter_DifferentDomainsIndependent(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_EvictExpiredDomains_RemovesExpired(t *testing.T) {
+	start := time.Now()
+	rl := newTestRateLimiter(nil, makeRateLimit(1, time.Hour), func() time.Time { return start })
+	rl.recordDomain("example.com")
+	rl.recordDomain("other.com")
+
+	rl.now = func() time.Time { return start.Add(time.Hour + time.Second) }
+	rl.evictExpiredDomains()
+
+	rl.mu.Lock()
+	_, hasExample := rl.domains["example.com"]
+	_, hasOther := rl.domains["other.com"]
+	rl.mu.Unlock()
+
+	if hasExample || hasOther {
+		t.Error("expected expired domains to be evicted")
+	}
+}
+
+func TestRateLimiter_EvictExpiredDomains_KeepsActive(t *testing.T) {
+	start := time.Now()
+	rl := newTestRateLimiter(nil, makeRateLimit(5, time.Hour), func() time.Time { return start })
+	rl.recordDomain("example.com")
+
+	rl.now = func() time.Time { return start.Add(30 * time.Minute) }
+	rl.evictExpiredDomains()
+
+	rl.mu.Lock()
+	_, hasExample := rl.domains["example.com"]
+	rl.mu.Unlock()
+
+	if !hasExample {
+		t.Error("expected active domain to be retained")
+	}
+}
+
 func TestRateLimit_ValidateNilIsNoop(t *testing.T) {
 	var rl *RateLimit
 	if err := rl.validate(); err != nil {
