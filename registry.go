@@ -56,8 +56,14 @@ type SharedPool struct {
 	// capacity. Multiple entries allow tiered limits.
 	PerDomainRateLimit []*RateLimit `json:"per_domain_rate_limit,omitempty"`
 
-	// When true, pool state is not loaded from or saved to storage. Windows
-	// are reset on every process restart. Default false (persistent).
+	// When true, pool state is not persisted: it is neither loaded from storage
+	// on startup nor saved to storage on shutdown, config reload, or
+	// periodically. Windows reset to zero on every process restart.
+	//
+	// Use ephemeral pools when persistence would be counterproductive — for
+	// example, a burst limit intended to throttle a single deployment event
+	// rather than long-term issuance rate. The default (false) is persistent,
+	// which is the safe choice for production rate limits.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 

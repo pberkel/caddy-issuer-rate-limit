@@ -41,8 +41,8 @@ type rateLimitState struct {
 	domains         map[string][]*slidingWindow
 	totalLimits     []*RateLimit
 	perDomainLimits []*RateLimit
-	now             func() time.Time
 	stopEviction    func() // non-nil when a background eviction goroutine is running
+	now             func() time.Time
 }
 
 // slidingWindow tracks exact issuance timestamps within a rolling time window.

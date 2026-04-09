@@ -89,7 +89,7 @@ issuer rate_limit {
 |---|---|---|
 | `issuer <module> { ... }` | Yes | Inner issuer to delegate certificate issuance to. Any `tls.issuance` module is accepted. |
 | `local [<name>] { ... }` | No | Local rate limits scoped to this instance. The optional `<name>` is a stable identifier used as the key in the admin registry (see [Admin API](#admin-api)); if omitted, a UUID is generated at provision time. May appear at most once. |
-| `shared <name> { ... }` | No | Named shared pool. Rate limit state is shared across all `rate_limit` instances referencing the same name and persisted across restarts. May be repeated for multiple pools. See [Shared pools](#shared-pools) below. |
+| `shared <name> { ... }` | No | Named shared pool. Rate limit state is shared across all `rate_limit` instances referencing the same name. Persistent by default; use `ephemeral` inside the block to disable persistence. May be repeated for multiple pools. See [Shared pools](#shared-pools) below. |
 
 #### `local` block subdirectives
 
@@ -104,6 +104,7 @@ issuer rate_limit {
 |---|---|
 | `rate_limit <limit> <duration>` | Maximum new certificates across all domains within a rolling window for this pool. May be repeated for tiered limits. |
 | `per_domain_rate_limit <limit> <duration>` | Maximum new certificates per registrable domain within a rolling window for this pool. May be repeated for tiered limits. |
+| `ephemeral [true\|false]` | When `true`, pool state is not persisted across restarts (see [Ephemeral pools](#ephemeral-pools)). Bare `ephemeral` is equivalent to `ephemeral true`. Default: `false` (persistent). |
 
 ### JSON
 
@@ -195,6 +196,27 @@ shared global {
 **Limit changes:** if a pool's limits are changed across a config reload, the in-memory state is reset and a warning is logged.
 
 **Persistence:** shared pool state is saved to Caddy's configured storage backend on shutdown and config reload, and restored on startup. State is also saved periodically every 5 minutes, bounding the data lost on an unclean exit (OOM kill, SIGKILL). Storage key: `tls_issuer_rate_limit/pools/<name>.json`. Expired timestamps are pruned before saving.
+
+### Ephemeral pools
+
+By default, shared pool state survives process restarts — counters from the previous run are restored so that limits remain accurate across reloads and upgrades. This is the right default for production rate limits where continuity matters.
+
+Adding `ephemeral` to a shared block disables persistence entirely for that pool:
+
+```caddyfile
+shared burst {
+    rate_limit 50 10m
+    ephemeral
+}
+```
+
+An ephemeral pool's windows reset to zero on every process restart. No state is loaded from storage on startup and none is written on shutdown. Use ephemeral pools when:
+
+- The limit is intended to throttle short bursts within a running process rather than enforce a long-term cumulative cap.
+- You explicitly do not want prior issuance history to carry over after a restart or deployment.
+- You are testing limit behaviour and want a clean slate on each restart.
+
+`ephemeral true` and bare `ephemeral` are equivalent. `ephemeral false` is the default and may be specified explicitly for clarity.
 
 ## Admin API
 
